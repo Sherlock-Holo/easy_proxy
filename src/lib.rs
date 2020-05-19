@@ -1,5 +1,5 @@
-use std::io::Result;
 use std::io::{Error, ErrorKind};
+use std::io::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -8,7 +8,8 @@ use async_std::task;
 use futures_util::io::AsyncRead;
 use futures_util::io::AsyncWrite;
 use futures_util::StreamExt;
-use log::{info, warn, LevelFilter};
+use log::{info, LevelFilter, warn};
+use structopt::clap::AppSettings::*;
 use structopt::StructOpt;
 
 mod http;
@@ -18,7 +19,7 @@ mod socks;
 #[async_trait::async_trait]
 pub trait Proxy {
     async fn handle<R, W>(&self, reader: R, writer: W, addr: SocketAddr) -> Result<()>
-    where
+        where
         R: AsyncRead + Send + Unpin,
         W: AsyncWrite + Send + Unpin;
 }
@@ -68,6 +69,7 @@ mod compat {
 }
 
 #[derive(Debug, StructOpt)]
+#[structopt(setting(ColorAuto), setting(ColoredHelp))]
 struct Opt {
     #[structopt(short, long, help = "proxy listen address, such as `127.0.0.1:1888`")]
     listen_addr: String,
@@ -80,6 +82,7 @@ struct Opt {
 }
 
 #[derive(Debug, StructOpt)]
+#[structopt(setting(ColorAuto), setting(ColoredHelp))]
 enum SubCommand {
     /// specify http proxy server
     Http {
