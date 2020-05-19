@@ -1,0 +1,19 @@
+[package]
+name = "easy_proxy"
+version = "0.1.0"
+authors = ["Sherlock Holo <sherlockya@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-tls = { version = "0.7" }
+tokio = { version = "0.2", default-features = false }
+hyper = { version = "0.13", default-features = false }
+futures-util = "0.3"
+async-std = { version = "1.6.0-beta.1", features = ["attributes"] }
+async-trait = "0.1"
+structopt = { version = "0.3", features = ["color"] }
+libc = "0.2"
+log = "0.4"
+pretty_env_logger = "0.4"
