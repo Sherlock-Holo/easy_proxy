@@ -3,13 +3,17 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::net::IpAddr;
+use std::os::unix::io::AsRawFd;
 
 use async_std::net::{SocketAddr, TcpStream};
-use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use log::debug;
+use nix::fcntl;
+use nix::fcntl::SpliceFFlags;
+use smol::Async;
 
 const VERSION: u8 = 5;
+const PIPE_BUF_SIZE: usize = 65535;
 
 #[derive(Debug, Copy, Clone)]
 enum Cmd {
@@ -81,21 +85,23 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(addr: SocketAddr) -> Self {
+        // TODO remove it when smol merge my PRs
+        for _ in 0..num_cpus::get().min(1) * 2 {
+            std::thread::spawn(|| smol::run(futures_util::future::pending::<()>()));
+        }
+
         Self { addr }
     }
 }
 
 #[async_trait::async_trait]
 impl crate::Proxy for Proxy {
-    async fn handle<R, W>(&self, mut reader: R, mut writer: W, addr: SocketAddr) -> IoResult<()>
-    where
-        R: AsyncRead + Send + Unpin,
-        W: AsyncWrite + Send + Unpin,
-        Self: Sized,
-    {
+    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> IoResult<()> {
         debug!("target {}", addr);
 
-        let mut stream = TcpStream::connect(&self.addr).await?;
+        let local_stream = Async::new(stream.clone())?;
+
+        let mut remote_stream = TcpStream::connect(&self.addr).await?;
 
         let mut buf = if addr.is_ipv4() {
             vec![0; 4 + 4 + 2]
@@ -106,9 +112,9 @@ impl crate::Proxy for Proxy {
         buf[0] = VERSION;
         buf[1] = 1;
 
-        stream.write_all(&buf[..3]).await?;
+        remote_stream.write_all(&buf[..3]).await?;
 
-        stream.read_exact(&mut buf[..2]).await?;
+        remote_stream.read_exact(&mut buf[..2]).await?;
 
         if buf[0] != VERSION {
             return Err(Error::new(
@@ -146,9 +152,9 @@ impl crate::Proxy for Proxy {
             }
         }
 
-        stream.write_all(&buf).await?;
+        remote_stream.write_all(&buf).await?;
 
-        stream.read_exact(&mut buf[..4]).await?;
+        remote_stream.read_exact(&mut buf[..4]).await?;
 
         if buf[0] != VERSION {
             return Err(Error::new(
@@ -168,18 +174,20 @@ impl crate::Proxy for Proxy {
 
         match buf[3] {
             // buf size is always enough
-            1 => stream.read_exact(&mut buf[..4 + 2]).await?,
+            1 => remote_stream.read_exact(&mut buf[..4 + 2]).await?,
 
             3 => {
-                stream.read_exact(&mut buf[..1]).await?;
+                remote_stream.read_exact(&mut buf[..1]).await?;
 
                 let domain_len = buf[0] as usize;
 
                 // reuse buffer
                 if domain_len + 2 < buf.len() {
-                    stream.read_exact(&mut buf[..domain_len + 2]).await?;
+                    remote_stream.read_exact(&mut buf[..domain_len + 2]).await?;
                 } else {
-                    stream.read_exact(&mut vec![0; domain_len + 2]).await?;
+                    remote_stream
+                        .read_exact(&mut vec![0; domain_len + 2])
+                        .await?;
                 }
             }
 
@@ -188,7 +196,7 @@ impl crate::Proxy for Proxy {
                     buf = vec![0; 16 + 2];
                 }
 
-                stream.read_exact(&mut buf).await?;
+                remote_stream.read_exact(&mut buf).await?;
             }
 
             r#type => {
@@ -199,14 +207,93 @@ impl crate::Proxy for Proxy {
             }
         }
 
-        let mut read_stream = &stream;
-        let mut write_stream = &stream;
+        let remote_stream = Async::new(remote_stream)?;
 
-        let server_to_client = async_std::io::copy(&mut read_stream, &mut writer);
-        let client_to_server = async_std::io::copy(&mut reader, &mut write_stream);
+        let local_to_remote = zero_copy(&local_stream, &remote_stream, PIPE_BUF_SIZE);
+        let remote_to_local = zero_copy(&remote_stream, &local_stream, PIPE_BUF_SIZE);
 
-        futures_util::try_join!(server_to_client, client_to_server)?;
+        futures_util::try_join!(local_to_remote, remote_to_local)?;
 
         Ok(())
+    }
+}
+
+pub async fn zero_copy(
+    stream_in: &Async<TcpStream>,
+    stream_out: &Async<TcpStream>,
+    len: impl Into<Option<usize>>,
+) -> IoResult<usize> {
+    let len = len.into().unwrap_or_else(|| 4096);
+    let flags =
+        SpliceFFlags::SPLICE_F_NONBLOCK | SpliceFFlags::SPLICE_F_MORE | SpliceFFlags::SPLICE_F_MOVE;
+
+    let (pr, pw) = os_pipe::pipe()?;
+    let pr = Async::new(pr)?;
+    let pw = Async::new(pw)?;
+
+    let mut total = 0;
+
+    loop {
+        let mut n = loop {
+            break match fcntl::splice(
+                stream_in.as_raw_fd(),
+                None,
+                pw.as_raw_fd(),
+                None,
+                len,
+                flags,
+            )
+            .map_err(nix_error_to_io_error)
+            {
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    stream_in.readable().await?;
+                    pw.writable().await?;
+
+                    continue;
+                }
+
+                res => res?,
+            };
+        };
+
+        if n == 0 {
+            return Ok(total);
+        }
+
+        total += n;
+
+        while n > 0 {
+            let written = loop {
+                break match fcntl::splice(
+                    pr.as_raw_fd(),
+                    None,
+                    stream_out.as_raw_fd(),
+                    None,
+                    n,
+                    flags,
+                )
+                .map_err(nix_error_to_io_error)
+                {
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        pr.readable().await?;
+                        stream_out.writable().await?;
+
+                        continue;
+                    }
+
+                    res => res?,
+                };
+            };
+
+            n -= written;
+        }
+    }
+}
+
+fn nix_error_to_io_error(err: nix::Error) -> Error {
+    match err {
+        nix::Error::InvalidUtf8 | nix::Error::InvalidPath => Error::from(ErrorKind::InvalidInput),
+        nix::Error::UnsupportedOperation => Error::from_raw_os_error(libc::ENOTSUP),
+        nix::Error::Sys(errno) => Error::from(errno),
     }
 }

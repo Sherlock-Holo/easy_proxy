@@ -185,12 +185,7 @@ impl Proxy {
 
 #[async_trait::async_trait]
 impl crate::Proxy for Proxy {
-    async fn handle<R, W>(&self, mut reader: R, mut writer: W, addr: SocketAddr) -> IoResult<()>
-    where
-        R: AsyncRead + Send + Unpin,
-        W: AsyncWrite + Send + Unpin,
-        Self: Sized,
-    {
+    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> IoResult<()> {
         let addr: Uri = match addr.to_string().parse() {
             Err(err) => return Err(Error::new(ErrorKind::InvalidInput, err)),
             Ok(addr) => addr,
@@ -216,9 +211,11 @@ impl crate::Proxy for Proxy {
         let mut server_reader = Reader(server_reader);
         let mut server_writer = Writer(server_writer);
 
-        let client_to_server = async_std::io::copy(&mut reader, &mut server_writer);
+        let mut read_stream = stream;
+        let mut write_stream = stream;
 
-        let server_to_client = async_std::io::copy(&mut server_reader, &mut writer);
+        let client_to_server = async_std::io::copy(&mut read_stream, &mut server_writer);
+        let server_to_client = async_std::io::copy(&mut server_reader, &mut write_stream);
 
         futures_util::try_join!(client_to_server, server_to_client)?;
 

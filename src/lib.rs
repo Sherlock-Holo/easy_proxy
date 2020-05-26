@@ -1,14 +1,12 @@
-use std::io::{Error, ErrorKind};
 use std::io::Result;
+use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_std::net::TcpListener;
+use async_std::net::{TcpListener, TcpStream};
 use async_std::task;
-use futures_util::io::AsyncRead;
-use futures_util::io::AsyncWrite;
 use futures_util::StreamExt;
-use log::{info, LevelFilter, warn};
+use log::{info, warn, LevelFilter};
 use structopt::clap::AppSettings::*;
 use structopt::StructOpt;
 
@@ -18,10 +16,7 @@ mod socks;
 
 #[async_trait::async_trait]
 pub trait Proxy {
-    async fn handle<R, W>(&self, reader: R, writer: W, addr: SocketAddr) -> Result<()>
-        where
-        R: AsyncRead + Send + Unpin,
-        W: AsyncWrite + Send + Unpin;
+    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> Result<()>;
 }
 
 mod compat {
@@ -156,10 +151,7 @@ async fn handle<T: 'static + Proxy + Send + Sync>(proxy: Arc<T>, mut listener: l
         let proxy = proxy.clone();
 
         task::spawn(async move {
-            let mut reader = &stream;
-            let mut writer = &stream;
-
-            if let Err(err) = proxy.handle(&mut reader, &mut writer, target_addr).await {
+            if let Err(err) = proxy.handle(&stream, target_addr).await {
                 warn!("proxy failed {}", err);
             }
         });
