@@ -98,14 +98,23 @@ impl crate::Proxy for Proxy {
     async fn handle(&self, stream: TcpStream, addr: SocketAddr) -> IoResult<()> {
         debug!("target {}", addr);
 
+        stream.set_nodelay(true)?;
+
         let local_stream_fd = stream.as_raw_fd();
         let local_stream_fd = unistd::dup(local_stream_fd).map_err(nix_error_to_io_error)?;
+
+        set_non_block(local_stream_fd)?;
+
+        debug!("set local tcp non block");
+
         let local_stream_fd = EventedFd(&local_stream_fd);
         drop(stream);
 
         let local_stream = Arc::new(PollEvented::new(local_stream_fd)?);
 
         let mut remote_stream = TcpStream::connect(&self.addr).await?;
+
+        remote_stream.set_nodelay(true)?;
 
         let mut buf = if addr.is_ipv4() {
             vec![0; 4 + 4 + 2]
@@ -117,6 +126,7 @@ impl crate::Proxy for Proxy {
         buf[1] = 1;
 
         remote_stream.write_all(&buf[..3]).await?;
+        remote_stream.flush().await?;
 
         remote_stream.read_exact(&mut buf[..2]).await?;
 
@@ -157,6 +167,7 @@ impl crate::Proxy for Proxy {
         }
 
         remote_stream.write_all(&buf).await?;
+        remote_stream.flush().await?;
 
         remote_stream.read_exact(&mut buf[..4]).await?;
 
@@ -213,9 +224,13 @@ impl crate::Proxy for Proxy {
             }
         }
 
-        // let remote_stream = Async::new(remote_stream)?;
         let remote_stream_fd = remote_stream.as_raw_fd();
         let remote_stream_fd = unistd::dup(remote_stream_fd).map_err(nix_error_to_io_error)?;
+
+        set_non_block(remote_stream_fd)?;
+
+        debug!("set remote tcp non block");
+
         let remote_stream_fd = EventedFd(&remote_stream_fd);
         drop(remote_stream);
 
@@ -244,7 +259,12 @@ pub async fn zero_copy(
     let pw_fd = pw.as_raw_fd();
 
     set_non_block(pr_fd)?;
+
+    debug!("set read pipe non-block");
+
     set_non_block(pw_fd)?;
+
+    debug!("set write pipe non-block");
 
     let pr = PollEvented::new(EventedFd(&pr_fd))?;
     let pw = PollEvented::new(EventedFd(&pw_fd))?;
@@ -264,6 +284,8 @@ pub async fn zero_copy(
             .map_err(nix_error_to_io_error)
             {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    debug!("tcp to pipe would block");
+
                     futures_util::future::poll_fn(|cx| {
                         stream_in.poll_read_ready(cx, Ready::readable())
                     })
@@ -305,6 +327,8 @@ pub async fn zero_copy(
                 .map_err(nix_error_to_io_error)
                 {
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        debug!("pipe to tcp would block");
+
                         futures_util::future::poll_fn(|cx| {
                             pr.poll_read_ready(cx, Ready::readable())
                         })
