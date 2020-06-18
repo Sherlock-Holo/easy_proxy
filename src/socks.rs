@@ -2,15 +2,19 @@ use std::convert::TryFrom;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
-use std::net::IpAddr;
-use std::os::unix::io::AsRawFd;
+use std::net::{IpAddr, SocketAddr};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
+use std::task::Poll;
 
-use async_std::net::{SocketAddr, TcpStream};
-use futures_util::{AsyncReadExt, AsyncWriteExt};
 use log::debug;
+use mio::unix::EventedFd;
+use mio::Ready;
 use nix::fcntl;
-use nix::fcntl::SpliceFFlags;
-use smol::Async;
+use nix::fcntl::{FcntlArg, OFlag, SpliceFFlags};
+use nix::unistd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, PollEvented};
+use tokio::net::TcpStream;
 
 const VERSION: u8 = 5;
 const PIPE_BUF_SIZE: usize = 65535;
@@ -85,21 +89,21 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(addr: SocketAddr) -> Self {
-        // TODO remove it when smol merge my PRs
-        for _ in 0..num_cpus::get().min(1) * 2 {
-            std::thread::spawn(|| smol::run(futures_util::future::pending::<()>()));
-        }
-
         Self { addr }
     }
 }
 
 #[async_trait::async_trait]
 impl crate::Proxy for Proxy {
-    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> IoResult<()> {
+    async fn handle(&self, stream: TcpStream, addr: SocketAddr) -> IoResult<()> {
         debug!("target {}", addr);
 
-        let local_stream = Async::new(stream.clone())?;
+        let local_stream_fd = stream.as_raw_fd();
+        let local_stream_fd = unistd::dup(local_stream_fd).map_err(nix_error_to_io_error)?;
+        let local_stream_fd = EventedFd(&local_stream_fd);
+        drop(stream);
+
+        let local_stream = Arc::new(PollEvented::new(local_stream_fd)?);
 
         let mut remote_stream = TcpStream::connect(&self.addr).await?;
 
@@ -174,7 +178,9 @@ impl crate::Proxy for Proxy {
 
         match buf[3] {
             // buf size is always enough
-            1 => remote_stream.read_exact(&mut buf[..4 + 2]).await?,
+            1 => {
+                remote_stream.read_exact(&mut buf[..4 + 2]).await?;
+            }
 
             3 => {
                 remote_stream.read_exact(&mut buf[..1]).await?;
@@ -207,7 +213,13 @@ impl crate::Proxy for Proxy {
             }
         }
 
-        let remote_stream = Async::new(remote_stream)?;
+        // let remote_stream = Async::new(remote_stream)?;
+        let remote_stream_fd = remote_stream.as_raw_fd();
+        let remote_stream_fd = unistd::dup(remote_stream_fd).map_err(nix_error_to_io_error)?;
+        let remote_stream_fd = EventedFd(&remote_stream_fd);
+        drop(remote_stream);
+
+        let remote_stream = Arc::new(PollEvented::new(remote_stream_fd)?);
 
         let local_to_remote = zero_copy(&local_stream, &remote_stream, PIPE_BUF_SIZE);
         let remote_to_local = zero_copy(&remote_stream, &local_stream, PIPE_BUF_SIZE);
@@ -219,8 +231,8 @@ impl crate::Proxy for Proxy {
 }
 
 pub async fn zero_copy(
-    stream_in: &Async<TcpStream>,
-    stream_out: &Async<TcpStream>,
+    stream_in: &PollEvented<EventedFd<'_>>,
+    stream_out: &PollEvented<EventedFd<'_>>,
     len: impl Into<Option<usize>>,
 ) -> IoResult<usize> {
     let len = len.into().unwrap_or_else(|| 4096);
@@ -228,17 +240,23 @@ pub async fn zero_copy(
         SpliceFFlags::SPLICE_F_NONBLOCK | SpliceFFlags::SPLICE_F_MORE | SpliceFFlags::SPLICE_F_MOVE;
 
     let (pr, pw) = os_pipe::pipe()?;
-    let pr = Async::new(pr)?;
-    let pw = Async::new(pw)?;
+    let pr_fd = pr.as_raw_fd();
+    let pw_fd = pw.as_raw_fd();
+
+    set_non_block(pr_fd)?;
+    set_non_block(pw_fd)?;
+
+    let pr = PollEvented::new(EventedFd(&pr_fd))?;
+    let pw = PollEvented::new(EventedFd(&pw_fd))?;
 
     let mut total = 0;
 
     loop {
         let mut n = loop {
             break match fcntl::splice(
-                stream_in.as_raw_fd(),
+                *stream_in.get_ref().0,
                 None,
-                pw.as_raw_fd(),
+                *pw.get_ref().0,
                 None,
                 len,
                 flags,
@@ -246,8 +264,20 @@ pub async fn zero_copy(
             .map_err(nix_error_to_io_error)
             {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    stream_in.readable().await?;
-                    pw.writable().await?;
+                    futures_util::future::poll_fn(|cx| {
+                        stream_in.poll_read_ready(cx, Ready::readable())
+                    })
+                    .await?;
+
+                    futures_util::future::poll_fn(|cx| {
+                        Poll::Ready(stream_in.clear_read_ready(cx, Ready::readable()))
+                    })
+                    .await?;
+
+                    futures_util::future::poll_fn(|cx| pw.poll_write_ready(cx)).await?;
+
+                    futures_util::future::poll_fn(|cx| Poll::Ready(pw.clear_write_ready(cx)))
+                        .await?;
 
                     continue;
                 }
@@ -265,9 +295,9 @@ pub async fn zero_copy(
         while n > 0 {
             let written = loop {
                 break match fcntl::splice(
-                    pr.as_raw_fd(),
+                    *pr.get_ref().0,
                     None,
-                    stream_out.as_raw_fd(),
+                    *stream_out.get_ref().0,
                     None,
                     n,
                     flags,
@@ -275,8 +305,22 @@ pub async fn zero_copy(
                 .map_err(nix_error_to_io_error)
                 {
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        pr.readable().await?;
-                        stream_out.writable().await?;
+                        futures_util::future::poll_fn(|cx| {
+                            pr.poll_read_ready(cx, Ready::readable())
+                        })
+                        .await?;
+
+                        futures_util::future::poll_fn(|cx| {
+                            Poll::Ready(pr.clear_read_ready(cx, Ready::readable()))
+                        })
+                        .await?;
+
+                        futures_util::future::poll_fn(|cx| stream_out.poll_write_ready(cx)).await?;
+
+                        futures_util::future::poll_fn(|cx| {
+                            Poll::Ready(stream_out.clear_write_ready(cx))
+                        })
+                        .await?;
 
                         continue;
                     }
@@ -296,4 +340,13 @@ fn nix_error_to_io_error(err: nix::Error) -> Error {
         nix::Error::UnsupportedOperation => Error::from_raw_os_error(libc::ENOTSUP),
         nix::Error::Sys(errno) => Error::from(errno),
     }
+}
+
+fn set_non_block(fd: RawFd) -> IoResult<()> {
+    let flags = fcntl::fcntl(fd, FcntlArg::F_GETFL).map_err(nix_error_to_io_error)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+
+    fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(nix_error_to_io_error)?;
+
+    Ok(())
 }

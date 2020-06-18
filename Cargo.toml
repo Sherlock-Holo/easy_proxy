@@ -7,18 +7,19 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-tls = { version = "0.7" }
-tokio = { version = "0.2", default-features = false }
-hyper = { version = "0.13", default-features = false }
+hyper = "0.13"
 futures-util = "0.3"
-async-std = { version = "1.6.0", features = ["attributes"] }
 async-trait = "0.1"
 structopt = { version = "0.3", features = ["color"] }
 libc = "0.2"
 log = "0.4"
-pretty_env_logger = "0.4"
+simple_logger = "1.6"
 os_pipe = "0.9"
 nix = "0.17"
-#smol = "0.1"
-smol = { git = "https://github.com/Sherlock-Holo/smol", branch = "compat-async-std" }
-num_cpus = "1.13"
+mio = "0.6"
+tokio-rustls = "0.13"
+http = "0.2"
+
+[dependencies.tokio]
+version = "0.2"
+features = ["macros", "rt-core", "io-util", "stream", "net"]

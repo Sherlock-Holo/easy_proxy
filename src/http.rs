@@ -2,29 +2,17 @@ use std::future::Future;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use async_std::net::TcpStream;
-use async_tls::client::TlsStream;
-use async_tls::TlsConnector;
-use futures_util::io::{AsyncRead, AsyncWrite};
+use http::uri::Scheme;
 use hyper::client::connect::{Connected, Connection};
-use hyper::rt::Executor;
 use hyper::service::Service;
 use hyper::{Body, Client, Request, Uri};
-use tokio::io::AsyncRead as TokioRead;
-use tokio::io::AsyncWrite as TokioWrite;
-
-use crate::compat::*;
-
-#[derive(Debug, Default)]
-pub struct AsyncExecutor;
-
-impl Executor<Pin<Box<dyn Future<Output = ()> + Send>>> for AsyncExecutor {
-    fn execute(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        async_std::task::spawn(fut);
-    }
-}
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
 
 #[derive(Debug)]
 pub enum AsyncConnection {
@@ -46,7 +34,7 @@ impl Connection for AsyncConnection {
             }
 
             AsyncConnection::TLS(stream) => {
-                if let Ok(remote_addr) = stream.get_ref().peer_addr() {
+                if let Ok(remote_addr) = stream.get_ref().0.peer_addr() {
                     connected.extra(remote_addr)
                 } else {
                     connected
@@ -56,7 +44,7 @@ impl Connection for AsyncConnection {
     }
 }
 
-impl TokioRead for AsyncConnection {
+impl AsyncRead for AsyncConnection {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -69,7 +57,7 @@ impl TokioRead for AsyncConnection {
     }
 }
 
-impl TokioWrite for AsyncConnection {
+impl AsyncWrite for AsyncConnection {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
         match self.get_mut() {
             AsyncConnection::TCP(stream) => Pin::new(stream).poll_write(cx, buf),
@@ -86,25 +74,31 @@ impl TokioWrite for AsyncConnection {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         match self.get_mut() {
-            AsyncConnection::TCP(stream) => Pin::new(stream).poll_close(cx),
-            AsyncConnection::TLS(stream) => Pin::new(stream).poll_close(cx),
+            AsyncConnection::TCP(stream) => Pin::new(stream).poll_shutdown(cx),
+            AsyncConnection::TLS(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 struct InnerProxy {
     host: String,
     port: u16,
-    tls: bool,
+    tls: Option<TlsConnector>,
 }
 
 impl InnerProxy {
     fn new(addr: Uri) -> IoResult<Self> {
-        let tls = if let Some(scheme) = addr.scheme_str() {
-            scheme == "https"
+        let tls = if let Some(scheme) = addr.scheme() {
+            if scheme == &Scheme::HTTPS {
+                Some(TlsConnector::from(Arc::new(
+                    tokio_rustls::rustls::ClientConfig::default(),
+                )))
+            } else {
+                None
+            }
         } else {
-            false
+            None
         };
 
         let port = if let Some(port) = addr.port_u16() {
@@ -117,7 +111,7 @@ impl InnerProxy {
                     return Err(Error::new(
                         ErrorKind::InvalidInput,
                         "unknown scheme or port",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -149,16 +143,19 @@ impl Service<Uri> for InnerProxy {
 
     fn call(&mut self, _req: Uri) -> Self::Future {
         let host = self.host.to_string();
-        let tls = self.tls;
+        let tls = self.tls.clone();
 
         let addr = format!("{}:{}", host, self.port);
 
         Box::pin(async move {
             let stream = TcpStream::connect(addr).await?;
 
-            if tls {
+            if let Some(tls) = tls {
+                let dns_name_ref = tokio_rustls::webpki::DNSNameRef::try_from_ascii_str(&host)
+                    .map_err(|err| Error::new(ErrorKind::Other, err))?;
+
                 Ok(AsyncConnection::TLS(Box::new(
-                    TlsConnector::new().connect(host, stream).await?,
+                    tls.connect(dns_name_ref, stream).await?,
                 )))
             } else {
                 Ok(AsyncConnection::TCP(stream))
@@ -175,9 +172,7 @@ impl Proxy {
     pub fn new(uri: Uri) -> IoResult<Self> {
         let inner_proxy = InnerProxy::new(uri)?;
 
-        let client = Client::builder()
-            .executor(AsyncExecutor::default())
-            .build(inner_proxy);
+        let client = Client::builder().build(inner_proxy);
 
         Ok(Self { client })
     }
@@ -185,7 +180,7 @@ impl Proxy {
 
 #[async_trait::async_trait]
 impl crate::Proxy for Proxy {
-    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> IoResult<()> {
+    async fn handle(&self, mut stream: TcpStream, addr: SocketAddr) -> IoResult<()> {
         let addr: Uri = match addr.to_string().parse() {
             Err(err) => return Err(Error::new(ErrorKind::InvalidInput, err)),
             Ok(addr) => addr,
@@ -206,16 +201,12 @@ impl crate::Proxy for Proxy {
             Ok(upgraded) => upgraded,
         };
 
-        let (server_reader, server_writer) = tokio::io::split(upgraded);
+        let (mut server_reader, mut server_writer) = tokio::io::split(upgraded);
 
-        let mut server_reader = Reader(server_reader);
-        let mut server_writer = Writer(server_writer);
+        let (mut read_stream, mut write_stream) = stream.split();
 
-        let mut read_stream = stream;
-        let mut write_stream = stream;
-
-        let client_to_server = async_std::io::copy(&mut read_stream, &mut server_writer);
-        let server_to_client = async_std::io::copy(&mut server_reader, &mut write_stream);
+        let client_to_server = tokio::io::copy(&mut read_stream, &mut server_writer);
+        let server_to_client = tokio::io::copy(&mut server_reader, &mut write_stream);
 
         futures_util::try_join!(client_to_server, server_to_client)?;
 
