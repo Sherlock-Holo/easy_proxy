@@ -89,36 +89,25 @@ struct InnerProxy {
 
 impl InnerProxy {
     fn new(addr: Uri) -> IoResult<Self> {
-        let tls = if let Some(scheme) = addr.scheme() {
-            if scheme == &Scheme::HTTPS {
-                Some(TlsConnector::from(Arc::new(
-                    tokio_rustls::rustls::ClientConfig::default(),
-                )))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let (tls, port) = match addr.scheme() {
+            Some(scheme) => {
+                if scheme == &Scheme::HTTP {
+                    (None, 80)
+                } else if scheme == &Scheme::HTTPS {
+                    let tls = Some(TlsConnector::from(Arc::new(
+                        tokio_rustls::rustls::ClientConfig::default(),
+                    )));
 
-        let port = if let Some(port) = addr.port_u16() {
-            port
-        } else if let Some(scheme) = addr.scheme_str() {
-            match scheme {
-                "http" => 80,
-                "https" => 443,
-                _ => {
+                    (tls, 443)
+                } else {
                     return Err(Error::new(
                         ErrorKind::InvalidInput,
-                        "unknown scheme or port",
+                        format!("unknown scheme {}", scheme),
                     ));
                 }
             }
-        } else {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "unknown scheme or port",
-            ));
+
+            None => (None, 80),
         };
 
         let host = addr
