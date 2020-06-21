@@ -7,6 +7,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::task::Poll;
 
+use bytes::{Buf, BufMut, BytesMut};
 use log::debug;
 use mio::unix::EventedFd;
 use mio::Ready;
@@ -117,27 +118,31 @@ impl crate::Proxy for Proxy {
         remote_stream.set_nodelay(true)?;
 
         let mut buf = if addr.is_ipv4() {
-            vec![0; 4 + 4 + 2]
+            BytesMut::with_capacity(4 + 4 + 2)
         } else {
-            vec![0; 4 + 16 + 2]
+            BytesMut::with_capacity(4 + 16 + 2)
         };
 
-        buf[0] = VERSION;
-        buf[1] = 1;
+        buf.put_u8(VERSION);
+        buf.put_u8(1);
+        buf.put_u8(Auth::NoAuth.into());
 
-        remote_stream.write_all(&buf[..3]).await?;
+        remote_stream.write_all(&buf).await?;
         remote_stream.flush().await?;
 
-        remote_stream.read_exact(&mut buf[..2]).await?;
+        // Safety: cap >= 4 + 4 + 2
+        unsafe { buf.set_len(2) }
 
-        if buf[0] != VERSION {
+        remote_stream.read_exact(&mut buf).await?;
+
+        if buf.get_u8() != VERSION {
             return Err(Error::new(
                 ErrorKind::ConnectionAborted,
                 format!("socks server version is {} not {}", buf[0], VERSION),
             ));
         }
 
-        if buf[1] != Auth::NoAuth.into() {
+        if buf.get_u8() != Auth::NoAuth.into() {
             return Err(Error::new(
                 ErrorKind::ConnectionAborted,
                 format!(
@@ -148,37 +153,39 @@ impl crate::Proxy for Proxy {
             ));
         }
 
-        buf[0] = VERSION;
-        buf[1] = Cmd::Connect.into();
-        buf[2] = 0; // RSV
+        buf.put_u8(VERSION);
+        buf.put_u8(Cmd::Connect.into());
+        buf.put_u8(0); // RSV
 
-        buf[3] = if addr.is_ipv4() { 1 } else { 4 }; // addr type
+        if addr.is_ipv4() {
+            buf.put_u8(1);
+        } else {
+            buf.put_u8(4);
+        }
 
         match addr.ip() {
-            IpAddr::V4(v4_addr) => {
-                buf[4..8].copy_from_slice(&v4_addr.octets());
-                buf[8..10].copy_from_slice(&addr.port().to_be_bytes())
-            }
-
-            IpAddr::V6(v6_addr) => {
-                buf[4..20].copy_from_slice(&v6_addr.octets());
-                buf[20..22].copy_from_slice(&addr.port().to_be_bytes());
-            }
+            IpAddr::V4(v4_addr) => buf.put_slice(&v4_addr.octets()),
+            IpAddr::V6(v6_addr) => buf.put_slice(&v6_addr.octets()),
         }
+
+        buf.put_u16(addr.port());
 
         remote_stream.write_all(&buf).await?;
         remote_stream.flush().await?;
 
-        remote_stream.read_exact(&mut buf[..4]).await?;
+        // Safety: cap >= 4 + 4 + 2
+        unsafe { buf.set_len(4) }
 
-        if buf[0] != VERSION {
+        remote_stream.read_exact(&mut buf).await?;
+
+        if buf.get_u8() != VERSION {
             return Err(Error::new(
                 ErrorKind::ConnectionAborted,
                 format!("socks server version is {} not {}", buf[0], VERSION),
             ));
         }
 
-        let reply_code = ReplyCode::try_from(buf[1])?;
+        let reply_code = ReplyCode::try_from(buf.get_u8())?;
 
         if reply_code != ReplyCode::Succeeded {
             return Err(Error::new(
@@ -187,31 +194,40 @@ impl crate::Proxy for Proxy {
             ));
         }
 
-        match buf[3] {
-            // buf size is always enough
+        // ignore RSV
+        buf.advance(1);
+
+        match buf.get_u8() {
             1 => {
-                remote_stream.read_exact(&mut buf[..4 + 2]).await?;
+                // Safety: cap >= 4 + 4 + 2
+                unsafe { buf.set_len(4 + 2) }
+
+                remote_stream.read_exact(&mut buf).await?;
             }
 
             3 => {
-                remote_stream.read_exact(&mut buf[..1]).await?;
+                // Safety: cap >= 4 + 4 + 2
+                unsafe { buf.set_len(1) }
 
-                let domain_len = buf[0] as usize;
+                remote_stream.read_exact(&mut buf).await?;
 
-                // reuse buffer
-                if domain_len + 2 < buf.len() {
-                    remote_stream.read_exact(&mut buf[..domain_len + 2]).await?;
-                } else {
-                    remote_stream
-                        .read_exact(&mut vec![0; domain_len + 2])
-                        .await?;
+                let domain_len = buf.get_u8() as usize;
+
+                if domain_len + 2 > buf.capacity() {
+                    buf.reserve(domain_len + 2 - buf.capacity());
                 }
+
+                unsafe { buf.set_len(domain_len + 2) }
+
+                remote_stream.read_exact(&mut buf).await?;
             }
 
             4 => {
-                if buf.len() < 16 + 2 {
-                    buf = vec![0; 16 + 2];
+                if 16 + 2 > buf.capacity() {
+                    buf.reserve(16 + 2 - buf.capacity());
                 }
+
+                unsafe { buf.set_len(16 + 2) }
 
                 remote_stream.read_exact(&mut buf).await?;
             }

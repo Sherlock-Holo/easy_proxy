@@ -19,6 +19,7 @@ nix = "0.17"
 mio = "0.6"
 tokio-rustls = "0.13"
 http = "0.2"
+bytes = "0.5"
 
 [dependencies.tokio]
 version = "0.2"
