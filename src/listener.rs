@@ -5,8 +5,8 @@ use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use async_std::net::{Incoming, TcpListener, TcpStream};
 use futures_util::stream::Stream;
+use tokio::net::{TcpListener, TcpStream};
 
 fn get_original_addr<T: AsRawFd>(fd: &T) -> Result<SocketAddr> {
     let mut ipv6_addr = MaybeUninit::<libc::sockaddr_in6>::zeroed();
@@ -56,50 +56,13 @@ fn get_original_addr<T: AsRawFd>(fd: &T) -> Result<SocketAddr> {
     }
 }
 
-/*pub struct Listener(TcpListener);
-
-impl From<TcpListener> for Listener {
-    fn from(listener: TcpListener) -> Self {
-        Self(listener)
-    }
-}
-
-impl Stream for Listener {
-    type Item = Result<(TcpStream, SocketAddr)>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let future = self.0.accept();
-
-        futures_util::pin_mut!(future);
-
-        let result = futures_util::ready!(future.poll(cx));
-
-        match result {
-            Err(err) => Poll::Ready(Some(Err(err))),
-            Ok((stream, _)) => match get_original_addr(&stream) {
-                Err(err) => Poll::Ready(Some(Err(err))),
-                Ok(addr) => Poll::Ready(Some(Ok((stream, addr)))),
-            },
-        }
-    }
-}*/
-
 pub struct Listener {
-    _inner: Box<TcpListener>,
-    incoming: Incoming<'static>,
+    inner: TcpListener,
 }
 
 impl From<TcpListener> for Listener {
     fn from(listener: TcpListener) -> Self {
-        let listener = Box::new(listener);
-
-        let incoming = listener.incoming();
-        let incoming = unsafe { std::mem::transmute::<_, Incoming<'static>>(incoming) };
-
-        Self {
-            _inner: listener,
-            incoming,
-        }
+        Self { inner: listener }
     }
 }
 
@@ -107,14 +70,11 @@ impl Stream for Listener {
     type Item = Result<(TcpStream, SocketAddr)>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match futures_util::ready!(Pin::new(&mut self.incoming).poll_next(cx)) {
-            None => Poll::Ready(None),
-            Some(result) => match result {
+        match futures_util::ready!(self.inner.poll_accept(cx)) {
+            Err(err) => Poll::Ready(Some(Err(err))),
+            Ok((stream, _)) => match get_original_addr(&stream) {
                 Err(err) => Poll::Ready(Some(Err(err))),
-                Ok(stream) => match get_original_addr(&stream) {
-                    Err(err) => Poll::Ready(Some(Err(err))),
-                    Ok(addr) => Poll::Ready(Some(Ok((stream, addr)))),
-                },
+                Ok(addr) => Poll::Ready(Some(Ok((stream, addr)))),
             },
         }
     }

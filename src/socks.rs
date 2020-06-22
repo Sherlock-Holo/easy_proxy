@@ -2,15 +2,20 @@ use std::convert::TryFrom;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
-use std::net::IpAddr;
-use std::os::unix::io::AsRawFd;
+use std::net::{IpAddr, SocketAddr};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
+use std::task::Poll;
 
-use async_std::net::{SocketAddr, TcpStream};
-use futures_util::{AsyncReadExt, AsyncWriteExt};
+use bytes::{Buf, BufMut, BytesMut};
 use log::debug;
+use mio::unix::EventedFd;
+use mio::Ready;
 use nix::fcntl;
-use nix::fcntl::SpliceFFlags;
-use smol::Async;
+use nix::fcntl::{FcntlArg, OFlag, SpliceFFlags};
+use nix::unistd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, PollEvented};
+use tokio::net::TcpStream;
 
 const VERSION: u8 = 5;
 const PIPE_BUF_SIZE: usize = 65535;
@@ -85,45 +90,59 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(addr: SocketAddr) -> Self {
-        // TODO remove it when smol merge my PRs
-        for _ in 0..num_cpus::get().min(1) * 2 {
-            std::thread::spawn(|| smol::run(futures_util::future::pending::<()>()));
-        }
-
         Self { addr }
     }
 }
 
 #[async_trait::async_trait]
 impl crate::Proxy for Proxy {
-    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> IoResult<()> {
+    async fn handle(&self, stream: TcpStream, addr: SocketAddr) -> IoResult<()> {
         debug!("target {}", addr);
 
-        let local_stream = Async::new(stream.clone())?;
+        stream.set_nodelay(true)?;
+
+        let local_stream_fd = stream.as_raw_fd();
+        let local_stream_fd = unistd::dup(local_stream_fd).map_err(nix_error_to_io_error)?;
+
+        set_non_block(local_stream_fd)?;
+
+        debug!("set local tcp non block");
+
+        let local_stream_fd = EventedFd(&local_stream_fd);
+        drop(stream);
+
+        let local_stream = Arc::new(PollEvented::new(local_stream_fd)?);
 
         let mut remote_stream = TcpStream::connect(&self.addr).await?;
 
+        remote_stream.set_nodelay(true)?;
+
         let mut buf = if addr.is_ipv4() {
-            vec![0; 4 + 4 + 2]
+            BytesMut::with_capacity(4 + 4 + 2)
         } else {
-            vec![0; 4 + 16 + 2]
+            BytesMut::with_capacity(4 + 16 + 2)
         };
 
-        buf[0] = VERSION;
-        buf[1] = 1;
+        buf.put_u8(VERSION);
+        buf.put_u8(1);
+        buf.put_u8(Auth::NoAuth.into());
 
-        remote_stream.write_all(&buf[..3]).await?;
+        remote_stream.write_all(&buf).await?;
+        remote_stream.flush().await?;
 
-        remote_stream.read_exact(&mut buf[..2]).await?;
+        // Safety: cap >= 4 + 4 + 2
+        unsafe { buf.set_len(2) }
 
-        if buf[0] != VERSION {
+        remote_stream.read_exact(&mut buf).await?;
+
+        if buf.get_u8() != VERSION {
             return Err(Error::new(
                 ErrorKind::ConnectionAborted,
                 format!("socks server version is {} not {}", buf[0], VERSION),
             ));
         }
 
-        if buf[1] != Auth::NoAuth.into() {
+        if buf.get_u8() != Auth::NoAuth.into() {
             return Err(Error::new(
                 ErrorKind::ConnectionAborted,
                 format!(
@@ -134,36 +153,39 @@ impl crate::Proxy for Proxy {
             ));
         }
 
-        buf[0] = VERSION;
-        buf[1] = Cmd::Connect.into();
-        buf[2] = 0; // RSV
+        buf.put_u8(VERSION);
+        buf.put_u8(Cmd::Connect.into());
+        buf.put_u8(0); // RSV
 
-        buf[3] = if addr.is_ipv4() { 1 } else { 4 }; // addr type
-
-        match addr.ip() {
-            IpAddr::V4(v4_addr) => {
-                buf[4..8].copy_from_slice(&v4_addr.octets());
-                buf[8..10].copy_from_slice(&addr.port().to_be_bytes())
-            }
-
-            IpAddr::V6(v6_addr) => {
-                buf[4..20].copy_from_slice(&v6_addr.octets());
-                buf[20..22].copy_from_slice(&addr.port().to_be_bytes());
-            }
+        if addr.is_ipv4() {
+            buf.put_u8(1);
+        } else {
+            buf.put_u8(4);
         }
 
+        match addr.ip() {
+            IpAddr::V4(v4_addr) => buf.put_slice(&v4_addr.octets()),
+            IpAddr::V6(v6_addr) => buf.put_slice(&v6_addr.octets()),
+        }
+
+        buf.put_u16(addr.port());
+
         remote_stream.write_all(&buf).await?;
+        remote_stream.flush().await?;
 
-        remote_stream.read_exact(&mut buf[..4]).await?;
+        // Safety: cap >= 4 + 4 + 2
+        unsafe { buf.set_len(4) }
 
-        if buf[0] != VERSION {
+        remote_stream.read_exact(&mut buf).await?;
+
+        if buf.get_u8() != VERSION {
             return Err(Error::new(
                 ErrorKind::ConnectionAborted,
                 format!("socks server version is {} not {}", buf[0], VERSION),
             ));
         }
 
-        let reply_code = ReplyCode::try_from(buf[1])?;
+        let reply_code = ReplyCode::try_from(buf.get_u8())?;
 
         if reply_code != ReplyCode::Succeeded {
             return Err(Error::new(
@@ -172,29 +194,40 @@ impl crate::Proxy for Proxy {
             ));
         }
 
-        match buf[3] {
-            // buf size is always enough
-            1 => remote_stream.read_exact(&mut buf[..4 + 2]).await?,
+        // ignore RSV
+        buf.advance(1);
+
+        match buf.get_u8() {
+            1 => {
+                // Safety: cap >= 4 + 4 + 2
+                unsafe { buf.set_len(4 + 2) }
+
+                remote_stream.read_exact(&mut buf).await?;
+            }
 
             3 => {
-                remote_stream.read_exact(&mut buf[..1]).await?;
+                // Safety: cap >= 4 + 4 + 2
+                unsafe { buf.set_len(1) }
 
-                let domain_len = buf[0] as usize;
+                remote_stream.read_exact(&mut buf).await?;
 
-                // reuse buffer
-                if domain_len + 2 < buf.len() {
-                    remote_stream.read_exact(&mut buf[..domain_len + 2]).await?;
-                } else {
-                    remote_stream
-                        .read_exact(&mut vec![0; domain_len + 2])
-                        .await?;
+                let domain_len = buf.get_u8() as usize;
+
+                if domain_len + 2 > buf.capacity() {
+                    buf.reserve(domain_len + 2 - buf.capacity());
                 }
+
+                unsafe { buf.set_len(domain_len + 2) }
+
+                remote_stream.read_exact(&mut buf).await?;
             }
 
             4 => {
-                if buf.len() < 16 + 2 {
-                    buf = vec![0; 16 + 2];
+                if 16 + 2 > buf.capacity() {
+                    buf.reserve(16 + 2 - buf.capacity());
                 }
+
+                unsafe { buf.set_len(16 + 2) }
 
                 remote_stream.read_exact(&mut buf).await?;
             }
@@ -207,7 +240,17 @@ impl crate::Proxy for Proxy {
             }
         }
 
-        let remote_stream = Async::new(remote_stream)?;
+        let remote_stream_fd = remote_stream.as_raw_fd();
+        let remote_stream_fd = unistd::dup(remote_stream_fd).map_err(nix_error_to_io_error)?;
+
+        set_non_block(remote_stream_fd)?;
+
+        debug!("set remote tcp non block");
+
+        let remote_stream_fd = EventedFd(&remote_stream_fd);
+        drop(remote_stream);
+
+        let remote_stream = Arc::new(PollEvented::new(remote_stream_fd)?);
 
         let local_to_remote = zero_copy(&local_stream, &remote_stream, PIPE_BUF_SIZE);
         let remote_to_local = zero_copy(&remote_stream, &local_stream, PIPE_BUF_SIZE);
@@ -219,8 +262,8 @@ impl crate::Proxy for Proxy {
 }
 
 pub async fn zero_copy(
-    stream_in: &Async<TcpStream>,
-    stream_out: &Async<TcpStream>,
+    stream_in: &PollEvented<EventedFd<'_>>,
+    stream_out: &PollEvented<EventedFd<'_>>,
     len: impl Into<Option<usize>>,
 ) -> IoResult<usize> {
     let len = len.into().unwrap_or_else(|| 4096);
@@ -228,17 +271,28 @@ pub async fn zero_copy(
         SpliceFFlags::SPLICE_F_NONBLOCK | SpliceFFlags::SPLICE_F_MORE | SpliceFFlags::SPLICE_F_MOVE;
 
     let (pr, pw) = os_pipe::pipe()?;
-    let pr = Async::new(pr)?;
-    let pw = Async::new(pw)?;
+    let pr_fd = pr.as_raw_fd();
+    let pw_fd = pw.as_raw_fd();
+
+    set_non_block(pr_fd)?;
+
+    debug!("set read pipe non-block");
+
+    set_non_block(pw_fd)?;
+
+    debug!("set write pipe non-block");
+
+    let pr = PollEvented::new(EventedFd(&pr_fd))?;
+    let pw = PollEvented::new(EventedFd(&pw_fd))?;
 
     let mut total = 0;
 
     loop {
         let mut n = loop {
             break match fcntl::splice(
-                stream_in.as_raw_fd(),
+                *stream_in.get_ref().0,
                 None,
-                pw.as_raw_fd(),
+                *pw.get_ref().0,
                 None,
                 len,
                 flags,
@@ -246,8 +300,22 @@ pub async fn zero_copy(
             .map_err(nix_error_to_io_error)
             {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    stream_in.readable().await?;
-                    pw.writable().await?;
+                    debug!("tcp to pipe would block");
+
+                    futures_util::future::poll_fn(|cx| {
+                        stream_in.poll_read_ready(cx, Ready::readable())
+                    })
+                    .await?;
+
+                    futures_util::future::poll_fn(|cx| {
+                        Poll::Ready(stream_in.clear_read_ready(cx, Ready::readable()))
+                    })
+                    .await?;
+
+                    futures_util::future::poll_fn(|cx| pw.poll_write_ready(cx)).await?;
+
+                    futures_util::future::poll_fn(|cx| Poll::Ready(pw.clear_write_ready(cx)))
+                        .await?;
 
                     continue;
                 }
@@ -265,9 +333,9 @@ pub async fn zero_copy(
         while n > 0 {
             let written = loop {
                 break match fcntl::splice(
-                    pr.as_raw_fd(),
+                    *pr.get_ref().0,
                     None,
-                    stream_out.as_raw_fd(),
+                    *stream_out.get_ref().0,
                     None,
                     n,
                     flags,
@@ -275,8 +343,24 @@ pub async fn zero_copy(
                 .map_err(nix_error_to_io_error)
                 {
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        pr.readable().await?;
-                        stream_out.writable().await?;
+                        debug!("pipe to tcp would block");
+
+                        futures_util::future::poll_fn(|cx| {
+                            pr.poll_read_ready(cx, Ready::readable())
+                        })
+                        .await?;
+
+                        futures_util::future::poll_fn(|cx| {
+                            Poll::Ready(pr.clear_read_ready(cx, Ready::readable()))
+                        })
+                        .await?;
+
+                        futures_util::future::poll_fn(|cx| stream_out.poll_write_ready(cx)).await?;
+
+                        futures_util::future::poll_fn(|cx| {
+                            Poll::Ready(stream_out.clear_write_ready(cx))
+                        })
+                        .await?;
 
                         continue;
                     }
@@ -296,4 +380,13 @@ fn nix_error_to_io_error(err: nix::Error) -> Error {
         nix::Error::UnsupportedOperation => Error::from_raw_os_error(libc::ENOTSUP),
         nix::Error::Sys(errno) => Error::from(errno),
     }
+}
+
+fn set_non_block(fd: RawFd) -> IoResult<()> {
+    let flags = fcntl::fcntl(fd, FcntlArg::F_GETFL).map_err(nix_error_to_io_error)?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+
+    fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(nix_error_to_io_error)?;
+
+    Ok(())
 }

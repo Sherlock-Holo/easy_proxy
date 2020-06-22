@@ -3,12 +3,11 @@ use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_std::net::{TcpListener, TcpStream};
-use async_std::task;
 use futures_util::StreamExt;
-use log::{info, warn, LevelFilter};
+use log::{info, warn, Level};
 use structopt::clap::AppSettings::*;
 use structopt::StructOpt;
+use tokio::net::{TcpListener, TcpStream};
 
 mod http;
 mod listener;
@@ -16,51 +15,7 @@ mod socks;
 
 #[async_trait::async_trait]
 pub trait Proxy {
-    async fn handle(&self, stream: &TcpStream, addr: SocketAddr) -> Result<()>;
-}
-
-mod compat {
-    use std::io::Result;
-    use std::pin::Pin;
-    use std::task::Poll;
-
-    use futures_util::io::AsyncRead;
-    use futures_util::io::AsyncWrite;
-    use futures_util::task::Context;
-    use tokio::io::AsyncRead as TokioRead;
-    use tokio::io::AsyncWrite as TokioWrite;
-
-    pub struct Reader<T>(pub T);
-
-    impl<T: TokioRead + Unpin> AsyncRead for Reader<T> {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<Result<usize>> {
-            Pin::new(&mut self.0).poll_read(cx, buf)
-        }
-    }
-
-    pub struct Writer<T>(pub T);
-
-    impl<T: TokioWrite + Unpin> AsyncWrite for Writer<T> {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize>> {
-            Pin::new(&mut self.0).poll_write(cx, buf)
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-            Pin::new(&mut self.0).poll_flush(cx)
-        }
-
-        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-            Pin::new(&mut self.0).poll_shutdown(cx)
-        }
-    }
+    async fn handle(&self, stream: TcpStream, addr: SocketAddr) -> Result<()>;
 }
 
 #[derive(Debug, StructOpt)]
@@ -150,8 +105,8 @@ async fn handle<T: 'static + Proxy + Send + Sync>(proxy: Arc<T>, mut listener: l
 
         let proxy = proxy.clone();
 
-        task::spawn(async move {
-            if let Err(err) = proxy.handle(&stream, target_addr).await {
+        tokio::spawn(async move {
+            if let Err(err) = proxy.handle(stream, target_addr).await {
                 warn!("proxy failed {}", err);
             }
         });
@@ -159,13 +114,9 @@ async fn handle<T: 'static + Proxy + Send + Sync>(proxy: Arc<T>, mut listener: l
 }
 
 pub fn log_init(debug: bool) {
-    let mut builder = pretty_env_logger::formatted_timed_builder();
-
     if debug {
-        builder.filter_level(LevelFilter::Debug);
+        simple_logger::init_with_level(Level::Debug).unwrap()
     } else {
-        builder.filter_level(LevelFilter::Info);
+        simple_logger::init_with_level(Level::Info).unwrap()
     }
-
-    builder.init();
 }
