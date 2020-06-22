@@ -89,7 +89,7 @@ struct InnerProxy {
 
 impl InnerProxy {
     fn new(addr: Uri) -> IoResult<Self> {
-        let (tls, port) = match addr.scheme() {
+        let (tls, mut port) = match addr.scheme() {
             Some(scheme) => {
                 if scheme == &Scheme::HTTP {
                     (None, 80)
@@ -109,6 +109,8 @@ impl InnerProxy {
 
             None => (None, 80),
         };
+
+        port = addr.port_u16().unwrap_or_else(|| port);
 
         let host = addr
             .host()
