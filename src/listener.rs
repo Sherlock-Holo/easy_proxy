@@ -69,7 +69,7 @@ impl From<TcpListener> for Listener {
 impl Stream for Listener {
     type Item = Result<(TcpStream, SocketAddr)>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match futures_util::ready!(self.inner.poll_accept(cx)) {
             Err(err) => Poll::Ready(Some(Err(err))),
             Ok((stream, _)) => match get_original_addr(&stream) {

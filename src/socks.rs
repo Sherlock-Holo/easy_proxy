@@ -3,18 +3,16 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::task::Poll;
 
 use bytes::{Buf, BufMut, BytesMut};
 use log::debug;
-use mio::unix::EventedFd;
-use mio::Ready;
 use nix::fcntl;
 use nix::fcntl::{FcntlArg, OFlag, SpliceFFlags};
 use nix::unistd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, PollEvented};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::unix::AsyncFd;
 use tokio::net::TcpStream;
 
 const VERSION: u8 = 5;
@@ -101,17 +99,17 @@ impl crate::Proxy for Proxy {
 
         stream.set_nodelay(true)?;
 
-        let local_stream_fd = stream.as_raw_fd();
-        let local_stream_fd = unistd::dup(local_stream_fd).map_err(nix_error_to_io_error)?;
+        let local_stream_fd = unistd::dup(stream.as_raw_fd()).map_err(nix_error_to_io_error)?;
 
-        set_non_block(local_stream_fd)?;
+        drop(stream);
+
+        set_non_block(&local_stream_fd)?;
 
         debug!("set local tcp non block");
 
-        let local_stream_fd = EventedFd(&local_stream_fd);
-        drop(stream);
+        let local_stream_async_fd = AsyncFd::new(local_stream_fd)?;
 
-        let local_stream = Arc::new(PollEvented::new(local_stream_fd)?);
+        let local_stream = Arc::new(local_stream_async_fd);
 
         let mut remote_stream = TcpStream::connect(&self.addr).await?;
 
@@ -240,17 +238,17 @@ impl crate::Proxy for Proxy {
             }
         }
 
-        let remote_stream_fd = remote_stream.as_raw_fd();
-        let remote_stream_fd = unistd::dup(remote_stream_fd).map_err(nix_error_to_io_error)?;
+        let remote_stream_fd =
+            unistd::dup(remote_stream.as_raw_fd()).map_err(nix_error_to_io_error)?;
+        drop(remote_stream);
 
-        set_non_block(remote_stream_fd)?;
+        set_non_block(&remote_stream_fd)?;
 
         debug!("set remote tcp non block");
 
-        let remote_stream_fd = EventedFd(&remote_stream_fd);
-        drop(remote_stream);
+        let remote_stream_async_fd = AsyncFd::new(remote_stream_fd)?;
 
-        let remote_stream = Arc::new(PollEvented::new(remote_stream_fd)?);
+        let remote_stream = Arc::new(remote_stream_async_fd);
 
         let local_to_remote = zero_copy(&local_stream, &remote_stream, PIPE_BUF_SIZE);
         let remote_to_local = zero_copy(&remote_stream, &local_stream, PIPE_BUF_SIZE);
@@ -262,114 +260,86 @@ impl crate::Proxy for Proxy {
 }
 
 pub async fn zero_copy(
-    stream_in: &PollEvented<EventedFd<'_>>,
-    stream_out: &PollEvented<EventedFd<'_>>,
+    stream_in: &AsyncFd<impl AsRawFd>,
+    stream_out: &AsyncFd<impl AsRawFd>,
     len: impl Into<Option<usize>>,
 ) -> IoResult<usize> {
-    let len = len.into().unwrap_or_else(|| 4096);
+    let len = len.into().unwrap_or(4096);
     let flags =
         SpliceFFlags::SPLICE_F_NONBLOCK | SpliceFFlags::SPLICE_F_MORE | SpliceFFlags::SPLICE_F_MOVE;
 
     let (pr, pw) = os_pipe::pipe()?;
-    let pr_fd = pr.as_raw_fd();
-    let pw_fd = pw.as_raw_fd();
 
-    set_non_block(pr_fd)?;
+    set_non_block(&pr)?;
 
     debug!("set read pipe non-block");
 
-    set_non_block(pw_fd)?;
+    set_non_block(&pw)?;
 
     debug!("set write pipe non-block");
 
-    let pr = PollEvented::new(EventedFd(&pr_fd))?;
-    let pw = PollEvented::new(EventedFd(&pw_fd))?;
+    let pr = AsyncFd::new(pr)?;
+    let pw = AsyncFd::new(pw)?;
 
     let mut total = 0;
 
     loop {
-        let mut n = loop {
-            break match fcntl::splice(
-                *stream_in.get_ref().0,
-                None,
-                *pw.get_ref().0,
-                None,
-                len,
-                flags,
-            )
+        let _stream_in_guard = stream_in.readable().await?;
+        let _pw_guard = pw.writable().await?;
+
+        let mut read = match fcntl::splice(
+            stream_in.as_raw_fd(),
+            None,
+            pw.as_raw_fd(),
+            None,
+            len,
+            flags,
+        )
             .map_err(nix_error_to_io_error)
-            {
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    debug!("tcp to pipe would block");
-
-                    futures_util::future::poll_fn(|cx| {
-                        stream_in.poll_read_ready(cx, Ready::readable())
-                    })
-                    .await?;
-
-                    futures_util::future::poll_fn(|cx| {
-                        Poll::Ready(stream_in.clear_read_ready(cx, Ready::readable()))
-                    })
-                    .await?;
-
-                    futures_util::future::poll_fn(|cx| pw.poll_write_ready(cx)).await?;
-
-                    futures_util::future::poll_fn(|cx| Poll::Ready(pw.clear_write_ready(cx)))
-                        .await?;
-
+        {
+            Err(err) => {
+                if err.kind() == ErrorKind::WouldBlock {
                     continue;
+                } else {
+                    return Err(err);
                 }
+            }
 
-                res => res?,
-            };
+            Ok(read) => read,
         };
 
-        if n == 0 {
+        if read == 0 {
             return Ok(total);
         }
 
-        total += n;
+        total += read;
 
-        while n > 0 {
-            let written = loop {
-                break match fcntl::splice(
-                    *pr.get_ref().0,
-                    None,
-                    *stream_out.get_ref().0,
-                    None,
-                    n,
-                    flags,
-                )
+        while read > 0 {
+            let _pr_guard = pr.readable().await?;
+            let _stream_out_guard = stream_out.writable().await?;
+
+            let written = match fcntl::splice(
+                pr.as_raw_fd(),
+                None,
+                stream_out.as_raw_fd(),
+                None,
+                read,
+                flags,
+            )
                 .map_err(nix_error_to_io_error)
-                {
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        debug!("pipe to tcp would block");
-
-                        futures_util::future::poll_fn(|cx| {
-                            pr.poll_read_ready(cx, Ready::readable())
-                        })
-                        .await?;
-
-                        futures_util::future::poll_fn(|cx| {
-                            Poll::Ready(pr.clear_read_ready(cx, Ready::readable()))
-                        })
-                        .await?;
-
-                        futures_util::future::poll_fn(|cx| stream_out.poll_write_ready(cx)).await?;
-
-                        futures_util::future::poll_fn(|cx| {
-                            Poll::Ready(stream_out.clear_write_ready(cx))
-                        })
-                        .await?;
-
+            {
+                Err(err) => {
+                    if err.kind() == ErrorKind::WouldBlock {
                         continue;
+                    } else {
+                        return Err(err);
                     }
+                }
 
-                    res => res?,
-                };
+                Ok(written) => written,
             };
 
-            n -= written;
+            read -= written;
         }
     }
 }
@@ -382,11 +352,11 @@ fn nix_error_to_io_error(err: nix::Error) -> Error {
     }
 }
 
-fn set_non_block(fd: RawFd) -> IoResult<()> {
-    let flags = fcntl::fcntl(fd, FcntlArg::F_GETFL).map_err(nix_error_to_io_error)?;
+fn set_non_block<F: AsRawFd>(fd: &F) -> IoResult<()> {
+    let flags = fcntl::fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL).map_err(nix_error_to_io_error)?;
     let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
 
-    fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(nix_error_to_io_error)?;
+    fcntl::fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(flags)).map_err(nix_error_to_io_error)?;
 
     Ok(())
 }

@@ -1,10 +1,11 @@
-use std::io::Result;
 use std::io::{Error, ErrorKind};
+use std::io::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use log::{info, warn, Level};
+use log::{info, Level, warn};
+use simple_logger::SimpleLogger;
 use structopt::clap::AppSettings::*;
 use structopt::StructOpt;
 use tokio::net::{TcpListener, TcpStream};
@@ -115,8 +116,14 @@ async fn handle<T: 'static + Proxy + Send + Sync>(proxy: Arc<T>, mut listener: l
 
 pub fn log_init(debug: bool) {
     if debug {
-        simple_logger::init_with_level(Level::Debug).unwrap()
+        SimpleLogger::new()
+            .with_level(Level::Debug.to_level_filter())
+            .init()
+            .unwrap()
     } else {
-        simple_logger::init_with_level(Level::Info).unwrap()
+        SimpleLogger::new()
+            .with_level(Level::Info.to_level_filter())
+            .init()
+            .unwrap()
     }
 }

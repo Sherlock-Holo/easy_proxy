@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::uri::Scheme;
+use hyper::{Body, Client, Request, upgrade, Uri};
 use hyper::client::connect::{Connected, Connection};
 use hyper::service::Service;
-use hyper::{Body, Client, Request, Uri};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -48,8 +48,8 @@ impl AsyncRead for AsyncConnection {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<IoResult<usize>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<IoResult<()>> {
         match self.get_mut() {
             AsyncConnection::TCP(stream) => Pin::new(stream).poll_read(cx, buf),
             AsyncConnection::TLS(stream) => Pin::new(stream).poll_read(cx, buf),
@@ -110,7 +110,7 @@ impl InnerProxy {
             None => (None, 80),
         };
 
-        port = addr.port_u16().unwrap_or_else(|| port);
+        port = addr.port_u16().unwrap_or(port);
 
         let host = addr
             .host()
@@ -187,7 +187,7 @@ impl crate::Proxy for Proxy {
             Ok(resp) => resp,
         };
 
-        let upgraded = match resp.into_body().on_upgrade().await {
+        let upgraded = match upgrade::on(resp).await {
             Err(err) => return Err(Error::new(ErrorKind::Other, err)),
             Ok(upgraded) => upgraded,
         };
